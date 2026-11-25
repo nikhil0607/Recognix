@@ -1,0 +1,8 @@
+{
+    "class_start_time": "09:00 AM",
+    "face_confidence_threshold": 0.5,
+    "webcam_index": 0,
+    "sound_enabled": true,
+    "liveness_required": true,
+    "export_directory": "C:\\Users\\Nikhil Gupta\\Desktop"
+}
