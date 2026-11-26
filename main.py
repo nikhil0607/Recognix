@@ -40,6 +40,19 @@ ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
 
+def _open_low_latency_camera(cam_idx: int) -> cv2.VideoCapture:
+    """Opens webcam configured for smooth 640x480 @ 30fps with minimal frame buffering."""
+    cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW) if sys.platform.startswith("win") else cv2.VideoCapture(cam_idx)
+    if not cap or not cap.isOpened():
+        cap = cv2.VideoCapture(cam_idx)
+    if cap and cap.isOpened():
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 30)
+    return cap
+
+
 class ToastNotification(ctk.CTkFrame):
     """Floating toast notification for real-time feedback."""
     def __init__(self, master, message: str, toast_type: str = "success", duration_ms: int = 4000):
@@ -458,7 +471,11 @@ class MarkAttendancePage(ctk.CTkFrame):
         self.camera = None
         self.is_running = False
         self.cam_thread = None
+        self.ai_thread = None
         self.frame_queue = queue.Queue(maxsize=2)
+        self.frame_lock = threading.Lock()
+        self.latest_raw_frame = None
+        self.latest_faces = []
         self.last_attendance_times = {}  # cooldown cache to avoid spamming toast for same person
 
         self._build_ui()
@@ -557,10 +574,7 @@ class MarkAttendancePage(ctk.CTkFrame):
         self.video_label.update()
 
         try:
-            self.camera = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW) if sys.platform.startswith("win") else cv2.VideoCapture(cam_idx)
-            if not self.camera or not self.camera.isOpened():
-                # Fallback to standard backend
-                self.camera = cv2.VideoCapture(cam_idx)
+            self.camera = _open_low_latency_camera(cam_idx)
 
             if not self.camera.isOpened():
                 self.app.toast("Could not connect to webcam. Check index in Settings.", toast_type="danger")
@@ -571,18 +585,26 @@ class MarkAttendancePage(ctk.CTkFrame):
             return
 
         self.is_running = True
+        self.latest_faces = []
+        with self.frame_lock:
+            self.latest_raw_frame = None
         self.app.active_camera_page = self
         self.btn_camera.configure(text="⏹ Stop Camera", fg_color=COLOR_DANGER, hover_color="#DC2626")
 
-        # Start Camera Thread
+        # Start separate capture and AI threads so video stays at full FPS
         self.cam_thread = threading.Thread(target=self._camera_worker, daemon=True)
+        self.ai_thread = threading.Thread(target=self._ai_worker, daemon=True)
         self.cam_thread.start()
+        self.ai_thread.start()
 
-        # Start UI Update Loop
-        self.after(30, self._update_video_canvas)
+        # Start UI Update Loop (~60Hz poll)
+        self.after(16, self._update_video_canvas)
 
     def stop_camera(self):
         self.is_running = False
+        self.latest_faces = []
+        with self.frame_lock:
+            self.latest_raw_frame = None
         if self.camera:
             try:
                 self.camera.release()
@@ -596,38 +618,32 @@ class MarkAttendancePage(ctk.CTkFrame):
             self.app.active_camera_page = None
 
     def _camera_worker(self):
-        """Worker thread to capture frames and run face recognition + liveness detection."""
+        """High-FPS capture thread: reads webcam frames, draws cached overlays, and queues for display."""
         liveness_req = self.app.att_mgr.settings.get("liveness_required", True)
 
         while self.is_running and self.camera and self.camera.isOpened():
             ret, frame = self.camera.read()
             if not ret or frame is None:
-                time.sleep(0.03)
+                time.sleep(0.01)
                 continue
 
             # Mirror frame horizontally for natural webcam feel
             frame = cv2.flip(frame, 1)
 
-            # Process frame with face engine
-            annotated_frame, recognized_faces = self.app.face_engine.process_frame(
-                frame,
-                liveness_required=liveness_req
-            )
+            # Hand off latest frame to AI worker without blocking
+            with self.frame_lock:
+                self.latest_raw_frame = frame
 
-            # Check if any recognized student meets criteria to mark attendance
-            for f in recognized_faces:
-                if f["is_recognized"] and f["liveness_verified"]:
-                    roll = f["roll"]
-                    name = f["name"]
-                    now_ts = time.time()
-                    
-                    # 5-second cooldown per person to avoid repeated triggers in same minute
-                    if now_ts - self.last_attendance_times.get(roll, 0) > 5.0:
-                        self.last_attendance_times[roll] = now_ts
-                        self._trigger_mark_attendance(roll, name)
+            # Draw latest cached face overlays in <1ms
+            faces_snapshot = self.latest_faces
+            if faces_snapshot:
+                display_frame = frame.copy()
+                self.app.face_engine.draw_overlays(display_frame, faces_snapshot, liveness_required=liveness_req)
+            else:
+                display_frame = frame
 
             # Convert to PIL Image for Tkinter
-            rgb = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+            rgb = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(rgb)
 
             # Put in queue (drop older frame if buffer full)
@@ -637,7 +653,38 @@ class MarkAttendancePage(ctk.CTkFrame):
                 except queue.Empty:
                     pass
             self.frame_queue.put(pil_img)
-            time.sleep(0.01)
+
+    def _ai_worker(self):
+        """Background AI thread: runs face recognition and blink liveness on the latest available frame."""
+        liveness_req = self.app.att_mgr.settings.get("liveness_required", True)
+
+        while self.is_running:
+            frame_copy = None
+            with self.frame_lock:
+                if self.latest_raw_frame is not None:
+                    frame_copy = self.latest_raw_frame.copy()
+                    self.latest_raw_frame = None
+
+            if frame_copy is None:
+                time.sleep(0.015)
+                continue
+
+            recognized_faces = self.app.face_engine.analyze_frame(
+                frame_copy,
+                liveness_required=liveness_req
+            )
+            self.latest_faces = recognized_faces
+
+            for f in recognized_faces:
+                if f["is_recognized"] and f["liveness_verified"]:
+                    roll = f["roll"]
+                    name = f["name"]
+                    now_ts = time.time()
+
+                    # 5-second cooldown per person to avoid repeated triggers in same minute
+                    if now_ts - self.last_attendance_times.get(roll, 0) > 5.0:
+                        self.last_attendance_times[roll] = now_ts
+                        self._trigger_mark_attendance(roll, name)
 
     def _trigger_mark_attendance(self, roll: str, name: str):
         """Dispatches attendance marking safely to UI thread."""
@@ -703,7 +750,7 @@ class MarkAttendancePage(ctk.CTkFrame):
         except queue.Empty:
             pass
 
-        self.after(30, self._update_video_canvas)
+        self.after(16, self._update_video_canvas)
 
 
 # ==============================================================================
@@ -852,9 +899,7 @@ class RegisterStudentPage(ctk.CTkFrame):
 
         cam_idx = int(self.app.att_mgr.settings.get("webcam_index", 0))
         try:
-            self.camera = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW) if sys.platform.startswith("win") else cv2.VideoCapture(cam_idx)
-            if not self.camera or not self.camera.isOpened():
-                self.camera = cv2.VideoCapture(cam_idx)
+            self.camera = _open_low_latency_camera(cam_idx)
 
             if not self.camera.isOpened():
                 self.app.toast("Failed to open webcam.", toast_type="danger")
@@ -871,7 +916,7 @@ class RegisterStudentPage(ctk.CTkFrame):
 
         self.cam_thread = threading.Thread(target=self._enrollment_worker, args=(roll, name), daemon=True)
         self.cam_thread.start()
-        self.after(30, self._update_preview)
+        self.after(16, self._update_preview)
 
     def stop_camera(self):
         self.is_capturing = False
@@ -889,40 +934,43 @@ class RegisterStudentPage(ctk.CTkFrame):
         import face_recognition
         samples = []
         last_capture_time = 0
+        frame_count = 0
+        last_boxes = []
 
         while self.is_capturing and self.camera and self.camera.isOpened():
             ret, frame = self.camera.read()
             if not ret or frame is None:
-                time.sleep(0.03)
+                time.sleep(0.01)
                 continue
 
             frame = cv2.flip(frame, 1)
             display_frame = frame.copy()
+            frame_count += 1
 
-            # Downsample for quick face location
-            small_rgb = cv2.cvtColor(cv2.resize(frame, (0, 0), fx=0.5, fy=0.5), cv2.COLOR_BGR2RGB)
-            boxes = face_recognition.face_locations(small_rgb, model="hog")
+            # Run face detection every 3rd frame to keep preview smooth
+            if frame_count % 3 == 1:
+                h, w = frame.shape[:2]
+                scale = min(0.5, 320.0 / float(w)) if w > 0 else 0.5
+                small_rgb = cv2.cvtColor(cv2.resize(frame, (0, 0), fx=scale, fy=scale), cv2.COLOR_BGR2RGB)
+                raw_boxes = face_recognition.face_locations(small_rgb, model="hog")
+                last_boxes = [tuple(int(v / scale) for v in b) for b in raw_boxes]
 
-            now = time.time()
-            if len(boxes) == 1:
-                top, right, bottom, left = [int(v * 2.0) for v in boxes[0]]
-                cv2.rectangle(display_frame, (left, top), (right, bottom), (34, 197, 94), 2)
-                cv2.putText(display_frame, f"Sample {len(samples)}/{self.sample_target}", (left, max(top - 10, 20)),
-                            cv2.FONT_HERSHEY_DUPLEX, 0.6, (34, 197, 94), 1, cv2.LINE_AA)
-
-                # Capture sample every 0.6 seconds to allow slight pose variation
-                if now - last_capture_time > 0.6 and len(samples) < self.sample_target:
+                now = time.time()
+                if len(last_boxes) == 1 and now - last_capture_time > 0.6 and len(samples) < self.sample_target:
                     samples.append(frame.copy())
                     last_capture_time = now
                     p_val = len(samples) / self.sample_target
                     self.after(0, lambda v=p_val, count=len(samples): self._update_progress_ui(v, count))
 
-            elif len(boxes) > 1:
-                # Multiple faces warning
+            if len(last_boxes) == 1:
+                top, right, bottom, left = last_boxes[0]
+                cv2.rectangle(display_frame, (left, top), (right, bottom), (34, 197, 94), 2)
+                cv2.putText(display_frame, f"Sample {len(samples)}/{self.sample_target}", (left, max(top - 10, 20)),
+                            cv2.FONT_HERSHEY_DUPLEX, 0.6, (34, 197, 94), 1, cv2.LINE_AA)
+            elif len(last_boxes) > 1:
                 cv2.putText(display_frame, "MULTIPLE FACES DETECTED - 1 FACE REQUIRED", (30, 40),
                             cv2.FONT_HERSHEY_DUPLEX, 0.6, (30, 64, 239), 2, cv2.LINE_AA)
             else:
-                # No face
                 cv2.putText(display_frame, "Looking for face... Please look directly into camera", (30, 40),
                             cv2.FONT_HERSHEY_DUPLEX, 0.6, (20, 184, 245), 1, cv2.LINE_AA)
 
@@ -935,11 +983,8 @@ class RegisterStudentPage(ctk.CTkFrame):
                     pass
             self.frame_queue.put(pil_img)
 
-            # Check if all samples collected
             if len(samples) >= self.sample_target:
                 break
-
-            time.sleep(0.02)
 
         # Process and complete enrollment
         if len(samples) >= self.sample_target:
@@ -1002,7 +1047,7 @@ class RegisterStudentPage(ctk.CTkFrame):
         except queue.Empty:
             pass
 
-        self.after(30, self._update_preview)
+        self.after(16, self._update_preview)
 
 
 # ==============================================================================

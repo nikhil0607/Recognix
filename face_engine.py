@@ -191,42 +191,33 @@ class FaceEngine:
 
         self.reload_faces()
 
-    def process_frame(
+    def analyze_frame(
         self,
         frame: np.ndarray,
         liveness_required: bool = True
-    ) -> tuple[np.ndarray, list[dict]]:
+    ) -> list[dict]:
         """
-        Processes a single camera video frame:
-        1. Downsamples for high-speed face detection.
-        2. Detects face locations and 128-d encodings.
-        3. Matches against cached registered faces.
-        4. Calculates Eye Aspect Ratio (EAR) for blink liveness detection.
-        5. Draws bounding boxes, student information, and liveness status on the frame.
-        
-        Returns:
-            annotated_frame: np.ndarray (BGR)
-            recognized_faces: list of dict [
-                {
-                    "roll": str,
-                    "name": str,
-                    "distance": float,
-                    "liveness_verified": bool,
-                    "box": (top, right, bottom, left)
-                }
-            ]
+        Runs face detection, 128-d recognition, and EAR blink liveness on a frame
+        without copying or drawing onto the frame. Designed for async AI workers.
         """
-        # Downscale frame for fast inference (0.5x scale)
-        scale_factor = 0.5
-        small_frame = cv2.resize(frame, (0, 0), fx=scale_factor, fy=scale_factor)
+        h, w = frame.shape[:2]
+        target_w = 320.0
+        scale_factor = min(0.5, target_w / float(w)) if w > 0 else 0.5
+
+        small_frame = cv2.resize(frame, (0, 0), fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_LINEAR)
         rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
         # Detect face boxes
         face_locations = face_recognition.face_locations(rgb_small_frame, model="hog")
-        face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations)
+        if not face_locations:
+            curr_time = time.time()
+            stale_keys = [k for k, v in self.liveness_tracker.items() if curr_time - v.get("last_seen", 0) > 3.0]
+            for k in stale_keys:
+                del self.liveness_tracker[k]
+            return []
 
-        # Detect 68-point facial landmarks for blink liveness
-        face_landmarks_list = face_recognition.face_landmarks(rgb_small_frame, face_locations) if face_locations else []
+        face_encodings = face_recognition.face_encodings(rgb_small_frame, face_locations) if self.known_encodings else [None] * len(face_locations)
+        face_landmarks_list = face_recognition.face_landmarks(rgb_small_frame, face_locations) if liveness_required else []
 
         curr_time = time.time()
         results = []
@@ -236,23 +227,19 @@ class FaceEngine:
         for k in stale_keys:
             del self.liveness_tracker[k]
 
-        annotated_frame = frame.copy()
-
         for idx, (face_loc, encoding) in enumerate(zip(face_locations, face_encodings)):
-            # Scale coordinates back up to original frame
             s_top, s_right, s_bottom, s_left = face_loc
             top = int(s_top / scale_factor)
             right = int(s_right / scale_factor)
             bottom = int(s_bottom / scale_factor)
             left = int(s_left / scale_factor)
 
-            # Determine identity
             name = "Unknown Person"
             roll = ""
             best_distance = 1.0
             is_recognized = False
 
-            if self.known_encodings:
+            if self.known_encodings and encoding is not None:
                 distances = face_recognition.face_distance(self.known_encodings, encoding)
                 min_idx = int(np.argmin(distances))
                 min_dist = float(distances[min_idx])
@@ -263,8 +250,7 @@ class FaceEngine:
                     roll = self.known_rolls[min_idx]
                     is_recognized = True
 
-            # Calculate Liveness / Blink
-            liveness_ok = not liveness_required  # Default true if liveness disabled
+            liveness_ok = not liveness_required
             tracker_key = roll if is_recognized else f"unk_{left}_{top}"
 
             if tracker_key not in self.liveness_tracker:
@@ -296,20 +282,46 @@ class FaceEngine:
 
                 liveness_ok = person_state.get("blinked", False)
 
-            # Append to recognized face results
-            face_data = {
+            results.append({
                 "roll": roll,
                 "name": name,
                 "distance": best_distance,
                 "liveness_verified": liveness_ok,
                 "is_recognized": is_recognized,
                 "box": (top, right, bottom, left)
-            }
-            results.append(face_data)
+            })
 
-            # Draw visual bounding box and info badge
-            self._draw_overlay(annotated_frame, top, right, bottom, left, name, roll, is_recognized, liveness_ok, liveness_required)
+        return results
 
+    def draw_overlays(self, frame: np.ndarray, recognized_faces: list[dict], liveness_required: bool = True):
+        """Draws cached face bounding boxes and status pills onto a frame in-place."""
+        for f in recognized_faces:
+            top, right, bottom, left = f["box"]
+            self._draw_overlay(
+                frame,
+                top,
+                right,
+                bottom,
+                left,
+                f["name"],
+                f["roll"],
+                f["is_recognized"],
+                f["liveness_verified"],
+                liveness_required
+            )
+
+    def process_frame(
+        self,
+        frame: np.ndarray,
+        liveness_required: bool = True
+    ) -> tuple[np.ndarray, list[dict]]:
+        """
+        Processes a single camera video frame synchronously and returns
+        (annotated_frame, recognized_faces).
+        """
+        results = self.analyze_frame(frame, liveness_required=liveness_required)
+        annotated_frame = frame.copy()
+        self.draw_overlays(annotated_frame, results, liveness_required=liveness_required)
         return annotated_frame, results
 
     def _draw_overlay(
